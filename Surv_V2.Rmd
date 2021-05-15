@@ -1,0 +1,452 @@
+---
+title: "Survival Analysis Head and Neck Cancer"
+author: "Sina Hartung"
+---
+
+```{r, imports, warning=F,message=F,include=F}
+
+# imports
+library(ggplot2)
+library(survival)
+library(survminer)
+library(glmnet)
+library(factoextra)
+library(tidyverse)
+library(matrixStats) 
+
+```
+
+# Helper functions
+
+```{r, helpers}
+
+get_elbow_plot <- function(k_start, k_end, data) {
+  # data needs to be transposed
+  wss <- sapply(k_start:k_end, function(k){
+    print(paste0('kmeans for k = ', k));
+    set.seed(1);
+    kmeans(t(data), k, iter.max = 50)$tot.withinss 
+    }
+  )
+  # plot
+  plt <- plot(k_start:k_end, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+  return(plt)
+}
+
+get_survival_df <- function(data, k, surv_df, print_=F) {
+  set.seed(1);
+  km <- kmeans(t(data), centers = k, iter.max = 100)
+  title_ = paste0('K=', k,' clusters of patients')
+  viz <- fviz_cluster(km, data = t(data), geom = "point") + ggtitle(title_)
+  if (print_) {
+    print(viz)  
+  }
+  clusters_ <- km$cluster %>% data.frame()
+  colnames(clusters_) <- 'cluster'
+  merge(clusters_, surv_df, by.x=0, by.y=0) %>% select(cluster, X3, X2, X1) -> df_surv_all
+  colnames(df_surv_all) <- c('c', 'time', 'surv', 'patient')
+  
+  df_surv_all %>% mutate(patient = stringr::str_replace_all(patient, '-', '.')) -> tmp  
+
+  merge(tmp, clinical_filtered, by.x='patient', by.y='ID') -> df_surv_all
+
+  df_surv_all %>% mutate_at(vars(time), as.numeric) -> df_surv_all
+  df_surv_all %>% mutate_at(vars(surv), as.numeric) -> df_surv_all
+  return(df_surv_all)
+} 
+
+```
+
+# Selected Genes
+
+```{r, gene subsets}
+
+# non-zero for classifier
+meth_genes = c('ANKRD1', 'GPX2', 'IRX1', 'MFAP5', 'MMP1', 'MPPED2', 'MSMB', 'NEFM', 'NPBWR1', 'PRKAA2', 'PRR4', 'SERPINA3', 'SLCO4C1')
+
+# non-zero for classifier
+rna_genes = c('ABCA8', 'ANKRD1', 'B4GALNT2', 'COBL', 'DMRTA1', 'FADS6', 'FLG2', 'GPX2', 'HOXC11', 'LCE1C', 'LRRN1', 'MFAP5', 'MMP3', 'MYEOV', 'MYLPF', 'NTSR1', 'OGDHL', 'PHYHD1', 'RPRM', 'SERPINA3', 'SOSTDC1', 'TRIM58', 'VTCN1', 'WISP3')
+
+# non-zero for classifier
+rna_genes2 = c("SMYD1", "SLCO1B3", "AMTN", "UTY", "OTOP3", "KBTBD10", "DEFB4A", "DES", "ASB5", "GABRP", "UGT1A6", "PRAME", "SLN", "UPK1B", "APOBEC2")
+
+# top features XBG
+xgb_genes = c("UGT1A6", "DUSP27", "RUNDC3B", "UPK1B", "GALC", "CSRP3", 	"FAM38B", "PRSS21", "AMTN", "C13orf18", "PFN2", "SMYD1", "C1orf110")
+
+```
+
+# Load data
+
+```{r, load data}
+# read expression data
+expr <- read.csv("expression_subset.csv", header = T, sep=',')
+expr_num <- expr %>% select(-Name, -ID)
+
+# survival data
+surv_data <- read.csv("surv_subset.csv", header = T, sep=',')
+head(surv_data) # 11 classes of region
+surv_t <- t(surv_data) %>% data.frame() %>% mutate_at(vars(X3), as.numeric) %>% mutate_at(vars(X2), as.numeric)
+
+# get variance per row / gene
+row_var = rowVars(as.matrix(expr_num), na.rm = T)
+expr$var = row_var
+
+# remove all NA columns
+expr <- expr[,colSums(is.na(expr))<nrow(expr)] 
+
+head(expr)
+
+# get dataframes for processing later
+expr %>% arrange(-var) %>% head(2000) %>% select(-Name, -ID, -var) -> expr_2000
+expr %>% arrange(-var) %>% head(200) %>% select(-Name, -ID, -var) -> expr_200
+expr %>% arrange(-var) %>% head(100) %>% select(-Name, -ID, -var) -> expr_100
+expr %>% filter(Name %in% meth_genes) %>% select(-Name, -ID, -var) -> meth_expr
+expr %>% filter(Name %in% rna_genes) %>% select(-Name, -ID, -var) -> rna_expr
+expr %>% filter(Name %in% c(rna_genes, meth_genes)) %>% select(-Name, -ID, -var) -> rna_meth_expr
+expr %>% filter(Name %in% rna_genes2) %>% select(-Name, -ID, -var) -> rna2_expr
+expr %>% filter(Name %in% xgb_genes) %>% select(-Name, -ID, -var) -> xgb_expr
+
+```
+
+## get new censored survival
+
+```{r, censored survival}
+
+surv_t %>% 
+  mutate(vital = case_when(
+    X3 >= 1825 ~ 0,
+    X3 < 1825 ~ X2)) %>%
+  mutate(time = case_when(
+    X3 >= 1825 ~ 1825,
+    X3 < 1825 ~ X3)) %>%
+  mutate(X2 = vital, X3 = time) -> surv_t_5Y
+ 
+surv_t %>% 
+  mutate(vital = case_when(
+    X3 >= 1095 ~ 0,
+    X3 < 1095 ~ X2)) %>%
+  mutate(time = case_when(
+    X3 >= 1095 ~ 1095,
+    X3 < 1095 ~ X3)) %>%
+  mutate(X2 = vital, X3 = time) -> surv_t_3Y
+
+surv_t %>% 
+  mutate(vital = case_when(
+    X3 >= 365 ~ 0,
+    X3 < 365 ~ X2)) %>%
+  mutate(time = case_when(
+    X3 >= 365 ~ 365,
+    X3 < 365 ~ X3)) %>%
+  mutate(X2 = vital, X3 = time) -> surv_t_1Y
+
+```
+
+## get clinical indicators
+
+```{r, clinical}
+clinical <- read.csv("clinical_indicators.csv", header = T, sep=',')
+colnames(clinical) <- c('ID', 'alcohol', 'therapy', 'age', 'alcohol_consumption', 'margin', 'neoplasm', 'hpv')
+head(clinical)
+patient_subset <- colnames(expr_100)
+
+#clinical %>% group_by(neoplasm) %>% summarise()
+
+clinical_filtered <- clinical %>% 
+  filter(ID %in% patient_subset) %>%
+  mutate(hpv = case_when(hpv == 'negative' ~0, hpv== 'positive' ~ 1)) %>% 
+  mutate(margin = case_when(margin == 'negative' ~0, margin== 'positive' ~ 1, margin == 'close' ~2)) %>%
+  mutate(alcohol = case_when(alcohol == 'no' ~0, alcohol== 'yes' ~ 1)) %>%
+  mutate(neoplasm = case_when(neoplasm == 'g1' ~1, 
+                              neoplasm== 'g2' ~ 2,
+                              neoplasm== 'g3' ~ 3,
+                              neoplasm== 'g4' ~ 4,
+                              neoplasm== 'gx' ~ 0,
+                              )) %>%
+  mutate(chemotherapy = case_when(therapy == 'chemotherapy' ~ 1, therapy != 'chemotherapy' ~ 0)) %>%
+  select(-therapy, -alcohol_consumption)
+  
+
+
+
+
+```
+
+# Methlyation data
+
+```{r, meth, fig.align="center", echo = FALSE,fig.width = 8, fig.height=8}
+# 5Y
+get_elbow_plot(1, 15, meth_expr)
+surv_df = get_survival_df(meth_expr, 3, surv_t_5Y)
+  
+surv_df %>% 
+  select(-age) %>%
+  mutate(cluster = c) %>%
+  mutate_at(vars(surv:chemotherapy), funs(factor(.))) %>%
+  
+  mutate(alcohol, alcohol = fct_recode(alcohol, 'No' = "0", 
+                                'Yes' = "1")) %>%
+  
+  mutate(hpv, hpv = fct_recode(hpv, 'No' = "0", 
+                                'Yes' = "1")) %>%
+
+  mutate(chemotherapy, chemotherapy = fct_recode(chemotherapy, 'No' = "0", 
+                                'Yes' = "1")) %>%
+  
+  mutate(margin, margin = fct_recode(margin, 'Neg' = "0", 
+                                'Pos' = "1", 'Close' = "2")) %>%
+  mutate(neoplasm, neoplasm = fct_recode(neoplasm, 'GX' = "0", 
+                                'G1' = "1", "G2" = "2", "G3" = "3", "G4" = "4")) %>%
+
+  mutate(surv, surv = fct_recode(surv, 'Alive' = "0", 
+                                'Dead' = "1")) %>%
+
+  pivot_longer(alcohol:chemotherapy, 'clinical', 'value') %>%
+  drop_na(value) %>%
+  
+  ggplot() +
+  geom_histogram(aes(x= factor(value), fill=factor(surv), na.rm=T), stat="count", na.rm = T) + facet_grid(cluster~clinical, scales='free_x', labeller = labeller(.rows = label_both, .cols = label_value)) + labs(fill='vital status', x = 'values')
+
+
+surv_df %>% 
+  select(age, c, surv) %>%
+  mutate(cluster = c) %>%
+  ggplot() +
+  geom_boxplot(aes(x= factor(c), y=age, fill=factor(c))) + labs(y='Age', x = 'Clusters') + theme(legend.position = "none")
+
+
+surv_df = get_survival_df(meth_expr, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurv <- ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE, 
+                     risk.table = TRUE, risk.table.col = "strata",
+                     conf.int = F) + 
+  ggtitle('3Y Survival') #ggtitle('5Y Survival stratified by HPV Status')
+
+#ggsurv$plot + facet_grid(~hpv) -> ggsurv$plot
+
+ggsurv
+
+###### save clusters to csv ######
+write.csv(surv_df, '5Y_Meth_clusters.csv')
+
+# 3Y
+surv_df = get_survival_df(meth_expr, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with methylation genes')
+
+
+# 1Y
+surv_df = get_survival_df(meth_expr, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with methylation genes')
+
+```
+
+
+
+
+# RNA data
+
+```{r, rna}
+get_elbow_plot(1, 15, rna_expr)
+
+# 5Y
+surv_df = get_survival_df(rna_expr, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with RNA genes')
+
+# 3Y
+surv_df = get_survival_df(rna_expr, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with RNA genes')
+
+
+# 1Y
+surv_df = get_survival_df(rna_expr, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with RNA genes')
+```
+
+
+
+# RNA data 2
+
+```{r, rna2}
+get_elbow_plot(1, 15, rna2_expr)
+
+# 5Y
+surv_df = get_survival_df(rna2_expr, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with RNA2 genes')
+
+# 3Y
+surv_df = get_survival_df(rna2_expr, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with RNA2 genes')
+
+
+# 1Y
+surv_df = get_survival_df(rna2_expr, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with RNA2 genes')
+```
+
+
+# XGB
+
+```{r, xgb, fig.align="center", echo = FALSE,fig.width = 8, fig.height=8}
+
+get_elbow_plot(1, 15, xgb_expr)
+
+surv_df = get_survival_df(xgb_expr, 3, surv_t_5Y)
+
+
+surv_df %>% 
+  select(-age) %>%
+  mutate(cluster = c) %>%
+  pivot_longer(alcohol:chemotherapy, 'clinical', 'value') %>%
+  ggplot() +
+  geom_histogram(aes(x= factor(value), fill=factor(surv)), stat="count") + facet_grid(cluster~clinical, scales='free_x', labeller = labeller(.rows = label_both, .cols = label_value)) + labs(fill='vital status', x = 'values')
+
+
+surv_df %>% 
+  select(age, c, surv) %>%
+  mutate(cluster = c) %>%
+  ggplot() +
+  geom_boxplot(aes(x= factor(c), y=age, fill=factor(c))) + labs(y='Age', x = 'Clusters') + theme(legend.position = "none")
+
+
+  surv_df = get_survival_df(xgb_expr, 3, surv_t_1Y)
+  surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+  ggsurv <- ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE, 
+                       risk.table = TRUE, risk.table.col = "strata",
+                       conf.int = F) + 
+    ggtitle('1Y Survival') #ggtitle('5Y Survival stratified by HPV Status')
+  
+  #ggsurv$plot + facet_grid(~chemotherapy) -> ggsurv$plot
+  
+  ggsurv
+
+
+
+# 5Y
+surv_df = get_survival_df(xgb_expr, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with XGB genes')
+
+# 3Y
+surv_df = get_survival_df(xgb_expr, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c + margin, data = surv_df)
+
+ggsurv <- ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + 
+  ggtitle('Survival for kmeans with XGB genes')
+
+ggsurv$plot + facet_grid(~margin)
+
+
+# 1Y
+surv_df = get_survival_df(xgb_expr, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with XGB genes')
+```
+
+
+# both RNA and Meth data
+
+```{r, both}
+get_elbow_plot(1, 15, rna_meth_expr)
+
+# 5Y
+surv_df = get_survival_df(rna_meth_expr, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with both genes')
+
+# 3Y
+surv_df = get_survival_df(rna_meth_expr, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with both genes')
+
+
+# 1Y
+surv_df = get_survival_df(rna_meth_expr, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with both genes')
+
+```
+
+
+# Top100
+
+```{r, top100}
+get_elbow_plot(1, 15, expr_100)
+
+# 5Y
+surv_df = get_survival_df(expr_100, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top100 genes')
+
+###### save clusters to csv ######
+write.csv(surv_df, '5Y_Top100_clusters.csv')
+
+# 3Y
+surv_df = get_survival_df(expr_100, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top100 genes')
+
+# 1Y
+surv_df = get_survival_df(expr_100, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top100 genes')
+
+```
+
+# Top200
+
+```{r, top200}
+get_elbow_plot(1, 15, expr_200)
+
+# 5Y
+surv_df = get_survival_df(expr_200, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top200 genes')
+
+###### save clusters to csv ######
+write.csv(surv_df, '5Y_Top200_clusters.csv')
+
+# 3Y
+surv_df = get_survival_df(expr_200, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top200 genes')
+
+# 1Y
+surv_df = get_survival_df(expr_200, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top200 genes')
+```
+
+# Top2000
+
+```{r, top2000}
+get_elbow_plot(1, 15, expr_2000)
+
+# 5Y
+surv_df = get_survival_df(expr_2000, 3, surv_t_5Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top2000 genes')
+
+# 3Y
+surv_df = get_survival_df(expr_2000, 3, surv_t_3Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top2000 genes')
+
+# 1Y
+surv_df = get_survival_df(expr_2000, 3, surv_t_1Y)
+surv_res = survfit(Surv(time, surv) ~ c, data = surv_df)
+ggsurvplot(surv_res, pval = TRUE, pval.method = TRUE) + ggtitle('Survival for kmeans with top2000 genes')
+
+```
+
+
+
